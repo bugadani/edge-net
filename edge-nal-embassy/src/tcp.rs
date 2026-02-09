@@ -1,7 +1,9 @@
 use core::fmt::Display;
+use core::future::{poll_fn, Future};
 use core::net::SocketAddr;
 use core::pin::pin;
 use core::ptr::NonNull;
+use core::task::Poll;
 
 use edge_nal::{Close, Readable, TcpBind, TcpConnect, TcpShutdown, TcpSplit};
 
@@ -222,7 +224,40 @@ impl Write for TcpSocket<'_> {
 
 impl Readable for TcpSocket<'_> {
     async fn readable(&mut self) -> Result<(), Self::Error> {
-        self.socket.wait_read_ready().await;
+        // embassy-net's wait_read_ready() only returns when can_recv() is true (data available),
+        // but does not return when the peer closes the connection (FIN received) with empty buffer.
+        // We need to also check may_recv() to detect when peer has sent FIN.
+        //
+        // This implementation relies on smoltcp waking the recv waker when the socket state
+        // changes such that may_recv() becomes false (i.e., when FIN is received).
+        //
+        // Evidence from smoltcp 0.12.0 source (src/socket/tcp.rs):
+        // - When FIN is received in ESTABLISHED state (line 1853-1858):
+        //   https://github.com/smoltcp-rs/smoltcp/blob/d2d647090d544b1e7c142571da9d55f7280f664b/src/socket/tcp.rs#L1853-L1858
+        //   `self.set_state(State::CloseWait)` is called
+        // - The `set_state` method (lines 1315-1329) unconditionally calls:
+        //   https://github.com/smoltcp-rs/smoltcp/blob/d2d647090d544b1e7c142571da9d55f7280f664b/src/socket/tcp.rs#L1315-L1329
+        //   `self.rx_waker.wake()` with comment "Wake all tasks waiting. Even if we
+        //   haven't received/sent data, this is needed because return values of
+        //   functions may change depending on the state."
+        //
+        // Therefore, when FIN is received, the waker registered by wait_read_ready()
+        // WILL be triggered, causing our poll_fn to be re-polled, at which point
+        // may_recv() will return false and we'll return Ready.
+
+        poll_fn(|cx| {
+            // Check if peer has closed the connection (FIN received)
+            if !self.socket.may_recv() {
+                // Peer has closed, socket is "readable" (will return EOF on subsequent read)
+                return Poll::Ready(());
+            }
+
+            // Check if data is available by polling wait_read_ready future
+            let read_ready_future = core::pin::pin!(self.socket.wait_read_ready());
+            read_ready_future.poll(cx)
+        })
+        .await;
+
         Ok(())
     }
 }
@@ -252,6 +287,11 @@ impl Read for TcpSocketRead<'_> {
 }
 
 impl Readable for TcpSocketRead<'_> {
+    /// Wait until the socket becomes readable.
+    ///
+    /// Note: TcpReader doesn't expose may_recv(), so we cannot detect FIN closure here.
+    /// This means readable() will not return when peer closes with empty buffer.
+    /// Callers using split sockets should handle 0-byte reads (EOF) appropriately.
     async fn readable(&mut self) -> Result<(), Self::Error> {
         self.0.wait_read_ready().await;
         Ok(())
